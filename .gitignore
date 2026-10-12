@@ -1,0 +1,9 @@
+# BIRD Mini-Dev databases (about 1.4 GB, downloaded from bird-bench): never commit
+data/
+
+# Python / Jupyter clutter
+__pycache__/
+.ipynb_checkpoints/
+
+# local test outputs
+work/
