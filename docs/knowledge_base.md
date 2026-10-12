@@ -10,6 +10,7 @@ Each section ends with **📚 Read more**: the papers and docs the explanation i
 4. [A story: one question from prompt to answer (context window vs. KV cache), and many questions at once](#4-a-story-one-question-from-prompt-to-answer-and-many-questions-at-once)
 5. [Prompts: the layers, the ingredients, classical formats, and the OmniSQL / Arctic formats](#5-prompts-the-layers-the-ingredients-classical-formats-and-the-omnisql--arctic-formats)
 6. [Model families: reading model names, Qwen, text-to-SQL specialists, distillation, explaining results, tool calling & MCP](#6-model-families-reading-model-names-qwen-text-to-sql-specialists-distillation-explaining-results-tool-calling--mcp)
+7. [Big schemas: when the full CREATE TABLE schema is too much, and what to do instead](#7-big-schemas-when-the-full-create-table-schema-is-too-much-and-what-to-do-instead)
 
 **Decisions so far**
 - Database to start with: **superhero** (small and simple, but most questions still need joins)
@@ -724,3 +725,87 @@ A "database MCP server" offers tools like `list_tables`, `describe_table`, `run_
 - **MCP:** [Anthropic: Introducing the Model Context Protocol](https://www.anthropic.com/news/model-context-protocol) (Nov 2024) · [MCP documentation](https://modelcontextprotocol.io)
 - **Tool calling with Qwen and vLLM:** [Qwen function-calling docs](https://qwen.readthedocs.io/en/latest/framework/function_call.html) · [vLLM tool calling docs](https://docs.vllm.ai/en/latest/features/tool_calling.html)
 - **Agentic text-to-SQL benchmark:** Lei et al., *Spider 2.0: Evaluating Language Models on Real-World Enterprise Text-to-SQL Workflows*, 2024. [arXiv:2411.07763](https://arxiv.org/abs/2411.07763)
+
+---
+
+## 7. Big schemas: when the full CREATE TABLE schema is too much, and what to do instead
+
+**Short answer:** for our benchmark the full schema is fine. For a big database (e.g. 62 tables with tens of columns each), pasting the whole
+schema stops working well.
+
+### 7.1 One clarification: the template doesn't need the *whole* database
+
+The OmniSQL and Arctic templates need *a* schema in `CREATE TABLE` format, but **not necessarily the whole database**. You can give them only
+the relevant tables and columns, in the same format.
+
+OmniSQL was even **trained that way on purpose**. Its data-preparation code (`process_dataset.py`) builds training prompts with the keys and
+the columns the gold SQL uses, plus a *random* share of the other columns, capped at 225 columns. So the model is used to seeing **partial schemas**.
+
+### 7.2 Why the full schema becomes a problem
+
+Rough numbers, based on the real superhero schema (2,897 characters for 31 columns, about **25-30 tokens per column** including keys and example values):
+
+| Database | Columns | Schema in prompt (estimate) | Fits our 8,192 limit? |
+|---|---|---|---|
+| superhero | 31 | ~850 tokens | ✅ easily |
+| european_football_2 (our largest) | 199 | ~5,000-6,000 tokens | ✅ yes |
+| **example: 62 tables × ~30 columns** | **~1,860** | **~45,000 tokens** | ❌ no. That's even beyond Qwen2.5's native 32k window |
+
+Three separate problems appear:
+1. **It doesn't fit** (the context window, §4). Even if you raise `max_model_len`, every question carries about 45k tokens of schema.
+2. **Accuracy drops.** The model must find 3 relevant columns among 1,860, a needle in a haystack. *Lost in the Middle* (Liu et al.) showed
+   that models use information at the start or end of a long input much better than information in the middle. Small models like our 1.5B/7B suffer most.
+3. **Cost and speed.** Prefill gets slow, and each question uses about 1.3 GB of KV cache (1.5B model), so fewer questions run at once.
+   Prefix caching (§3.6) softens this, because all questions on the same database share the schema part, but it doesn't fix problems 1 and 2.
+
+### 7.3 What to do instead: the toolbox from the literature
+
+**A. Schema linking: pick the relevant part first.** This is the classic answer, and it turns generation into a two-step pipeline:
+```
+question ──► [Step 1: SELECT relevant tables/columns] ──► small schema ──► [Step 2: write SQL with OmniSQL prompt]
+```
+There are three ways to do step 1:
+
+| Way | How | Example systems |
+|---|---|---|
+| Search | embed or keyword-match the question against table and column names and descriptions; keep the top matches + their foreign-key neighbours | retrieval steps in many pipelines |
+| Trained ranker | a small model scores how relevant each column is | RESDSQL, CodeS |
+| Ask the LLM | "Which tables and columns are needed?", then a second call with the pruned schema | DIN-SQL, MAC-SQL, CHESS (its Schema Selector cut tokens **×5** and *gained* about 2 % accuracy) |
+
+**⚠️ The big risk is recall.** If step 1 drops a column the answer needs, step 2 *cannot* be right. Maamari et al. ("The Death of Schema
+Linking?", 2024) argue that with strong models you should **skip** pruning whenever the full schema fits. Their system ranked first on BIRD that way.
+
+**B. Make the schema shorter.** Drop the example values, shorten comments, or use more compact formats (e.g. XiYan-SQL's "M-Schema").
+Chang & Fosler-Lussier also found that normalising the schema (lowercase, standard spacing) cuts tokens.
+
+**C. Use a long-context model.** Chung et al. (Google, VLDB 2025) put whole schemas plus extra context into Gemini 1.5 Pro and found that
+long-context models *"are robust and do not get lost"*. That's a big model with a huge window, though. On our T4s with 1.5B/7B models, A is more realistic.
+
+**D. Let the model explore** (the agentic / MCP idea from §6.5). The model calls `list_tables`, looks at only the tables it wants, and tries
+queries. Spider 2.0, with databases of **over 1,000 columns**, was built to test exactly this.
+
+**E. Bring the right values in.** OmniSQL retrieves database values that match words in the question (BM25 search), so the model sees e.g.
+`'3-D Man'` even if it's not among the two example values. This complements A.
+
+### 7.4 Rule of thumb
+
+| Situation | Approach |
+|---|---|
+| Schema fits comfortably, decent model | **full schema** (simplest; no recall risk) ← our BIRD Mini-Dev case |
+| Schema too big, or small model struggling | **prune (A)** with high recall: keep generously + foreign-key neighbours |
+| Huge enterprise database (hundreds or thousands of columns) | **agentic exploration (D)**, or prune + retrieve values (A + E) |
+
+**How to measure it in a thesis:** schema linking is evaluated separately with **recall** = the share of the gold SQL's tables and columns
+that step 1 kept. Then compare EX with the full schema vs. the pruned one, along with prompt tokens and time. A neat later experiment would be
+"full vs. pruned schema" on european_football_2, our largest database (see open_questions_todos.md, row 6).
+
+### 📚 Read more
+- **Long inputs and lost information:** Liu et al., *Lost in the Middle: How Language Models Use Long Contexts*, TACL 2024. [arXiv:2307.03172](https://arxiv.org/abs/2307.03172)
+- **Schema linking with a trained ranker:** Li et al., *RESDSQL: Decoupling Schema Linking and Skeleton Parsing for Text-to-SQL*, AAAI 2023. [arXiv:2302.05965](https://arxiv.org/abs/2302.05965) · Li et al., *CodeS: Towards Building Open-source Language Models for Text-to-SQL*, SIGMOD 2024. [arXiv:2402.16347](https://arxiv.org/abs/2402.16347)
+- **Schema linking by asking the LLM:** Pourreza & Rafiei, *DIN-SQL: Decomposed In-Context Learning of Text-to-SQL with Self-Correction*, NeurIPS 2023. [arXiv:2304.11015](https://arxiv.org/abs/2304.11015) · Wang et al., *MAC-SQL: A Multi-Agent Collaborative Framework for Text-to-SQL*, 2023. [arXiv:2312.11242](https://arxiv.org/abs/2312.11242) · Talaei et al., *CHESS: Contextual Harnessing for Efficient SQL Synthesis*, 2024 (Schema Selector: ×5 fewer tokens). [arXiv:2405.16755](https://arxiv.org/abs/2405.16755)
+- **Against pruning when the schema fits:** Maamari et al., *The Death of Schema Linking? Text-to-SQL in the Age of Well-Reasoned Language Models*, 2024. [arXiv:2408.07702](https://arxiv.org/abs/2408.07702)
+- **Long context instead of pruning:** Chung et al., *Is Long Context All You Need? Leveraging LLM's Extended Context for NL2SQL*, VLDB 2025. [arXiv:2501.12372](https://arxiv.org/abs/2501.12372)
+- **Compact schema format (M-Schema):** Gao et al., *A Preview of XiYan-SQL: A Multi-Generator Ensemble Framework for Text-to-SQL*, 2024. [arXiv:2411.08599](https://arxiv.org/abs/2411.08599)
+- **Schema normalisation:** Chang & Fosler-Lussier, 2023. [arXiv:2305.11853](https://arxiv.org/abs/2305.11853)
+- **Huge schemas and agents:** Lei et al., *Spider 2.0*, ICLR 2025 (databases with over 1,000 columns). [arXiv:2411.07763](https://arxiv.org/abs/2411.07763)
+- **Value retrieval and partial-schema training:** [OmniSQL paper](https://arxiv.org/abs/2503.02240) · [OmniSQL `process_dataset.py`](https://github.com/RUCKBReasoning/OmniSQL/blob/main/train_and_evaluate/process_dataset.py)

@@ -11,5 +11,6 @@ A quick list so nothing gets forgotten. Add a row whenever something comes up; c
 | 3 | ✅ TODO | First vLLM run: Qwen2.5-Coder-1.5B on the 52 superhero questions | 🔲 open | 2026-10-12 | OmniSQL prompt, see knowledge base §5 |
 | 4 | 💡 Idea | Later: compare against a newer Qwen (Qwen3 / 3.8). Check first that it fits on 2× T4 (may need 4-bit) | ⏸️ parked | 2026-10-12 | baseline first (Qwen2.5-based models) |
 | 5 | 💡 Idea | Later: "agentic" experiment: model explores the DB with tools (MCP / tool calling) vs. our one-shot prompt | ⏸️ parked | 2026-10-12 | needs a tool-capable model (Qwen3+); see Spider 2.0 |
-| 6 | | | | | |
+| 6 | ✅ TODO | **Study the literature first**, then explore 3 ways to handle big schemas: (a) models trained on a fixed template with the full schema (OmniSQL style), (b) big-schema optimisation (schema linking/pruning, compact formats, long context, value retrieval), (c) the MCP / agentic approach | 🔲 open | 2026-10-12 | Knowledge base §7 (+ §6.5). Possible experiment: full vs. pruned schema on european_football_2. Related: row 5 |
 | 7 | | | | | |
+| 8 | | | | | |
